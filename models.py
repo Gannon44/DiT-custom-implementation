@@ -14,6 +14,8 @@ import torch.nn as nn
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+import torch.nn.functional as F
+from torch.jit import Final
 
 
 def modulate(x, shift, scale):
@@ -23,45 +25,6 @@ def modulate(x, shift, scale):
 #################################################################################
 #               Embedding Layers for Timesteps and Class Labels                 #
 #################################################################################
-
-class TimestepEmbedder(nn.Module):
-    """
-    Embeds scalar timesteps into vector representations.
-    """
-    def __init__(self, hidden_size, frequency_embedding_size=256):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
-        )
-        self.frequency_embedding_size = frequency_embedding_size
-
-    @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
-        """
-        Create sinusoidal timestep embeddings.
-        :param t: a 1-D Tensor of N indices, one per batch element.
-                          These may be fractional.
-        :param dim: the dimension of the output.
-        :param max_period: controls the minimum frequency of the embeddings.
-        :return: an (N, D) Tensor of positional embeddings.
-        """
-        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
-        half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-        ).to(device=t.device)
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
-
-    def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        t_emb = self.mlp(t_freq)
-        return t_emb
 
 
 class LabelEmbedder(nn.Module):
@@ -98,21 +61,174 @@ class LabelEmbedder(nn.Module):
 #                                 Core DiT Model                                #
 #################################################################################
 
-class DiTBlock(nn.Module):
+
+class SiLUCustom(nn.Module):
+    def __init__(self):
+        super(SiLUCustom, self).__init__()
+
+    def forward(self, x):
+        return x * torch.sigmoid(x)
+
+class GELUCustom(nn.Module):
+    def __init__(self):
+        super(GELUCustom, self).__init__()
+    def forward(self, x):
+        coeff = torch.sqrt(torch.tensor(2. / torch.pi)) 
+        return 0.5 * x * (1 + torch.tanh(coeff * (x + 0.044715 * x**3)))
+
+class LayerNormCustom(nn.Module):
+    def __init__(self, normalized_shape, eps=1e-6, elementwise_affine=False, bias=True, device=None, dtype=None):
+        super(LayerNormCustom, self).__init__()
+        if isinstance(normalized_shape, (tuple, list)):
+            self.normalized_shape = normalized_shape
+        else:
+            self.normalized_shape = (normalized_shape,)
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+    
+    def forward(self, x):
+        mean = torch.mean(x, dim=-1,keepdim=True)
+        var = torch.var(x, dim=-1, keepdim=True, unbiased=False)
+        x_normalized = (x - mean) / torch.sqrt(var + self.eps)
+        return x_normalized
+
+class LinearCustom(nn.Module):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super(LinearCustom, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.randn(out_features, in_features) * (2 / (in_features + out_features)) ** 0.5)
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.bias = None
+
+    def forward(self, x: torch.Tensor):
+        output = x @ self.weight.T
+        if self.bias is not None:
+            output += self.bias
+        return output
+
+
+class DropoutCustom(nn.Module):
+    def __init__(self, p: float = 0.5):
+        super(DropoutCustom, self).__init__()
+        self.p = p
+        self.training = True
+
+    def forward(self, x: torch.Tensor):
+        if self.training:
+            mask = (torch.rand_like(x) > self.p).float()
+            return x * mask / (1 - self.p)
+        else:
+            return x
+
+class AttentionCustom(nn.Module):
+    def __init__(
+        self,
+        dim,
+        num_heads = 8,
+        qkv_bias = True,
+        qk_norm = False,
+        attn_drop = 0.,
+        proj_drop = 0.
+        ):
+        super().__init__()
+        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+
+        # Basic configurations
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        # Define layers
+        self.qkv = LinearCustom(dim, dim * 3, bias=qkv_bias) 
+        self.q_norm = LayerNormCustom(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = LayerNormCustom(self.head_dim) if qk_norm else nn.Identity()
+        self.attn_drop = DropoutCustom(attn_drop)
+        self.proj = LinearCustom(dim, dim)
+        self.proj_drop = DropoutCustom(proj_drop)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # B: batch size, N: sequence length, C: number of channels (dim)
+        B, N, C = x.shape 
+        
+        # Compute Q, K, V from the input x
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+
+        # Apply normalization if needed
+        q, k = self.q_norm(q), self.k_norm(k)
+
+        # Standard attention mechanism
+        q = q * self.scale
+        attn = torch.matmul(q, k.transpose(-2, -1))
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        x = torch.matmul(attn, v)
+
+        # Reshape the output and apply projection
+        x = x.transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+
+class TimestepEmbedderCustom(nn.Module):
+    """
+    Embeds scalar timesteps into vector representations.
+    """
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            LinearCustom(frequency_embedding_size, hidden_size, bias=True),
+            SiLUCustom(),
+            LinearCustom(hidden_size, hidden_size, bias=True),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        """
+        Create sinusoidal timestep embeddings.
+        :param t: a 1-D Tensor of N indices, one per batch element.
+                          These may be fractional.
+        :param dim: the dimension of the output.
+        :param max_period: controls the minimum frequency of the embeddings.
+        :return: an (N, D) Tensor of positional embeddings.
+        """
+        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+        ).to(device=t.device)
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    def forward(self, t):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_emb = self.mlp(t_freq)
+        return t_emb
+
+
+class DiTBlockCustom(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
         super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm1 = LayerNormCustom(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = AttentionCustom(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        self.norm2 = LayerNormCustom(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=GELUCustom, drop=0)
         self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+            SiLUCustom(),
+            LinearCustom(hidden_size, 6 * hidden_size, bias=True)
         )
 
     def forward(self, x, c):
@@ -121,18 +237,17 @@ class DiTBlock(nn.Module):
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
-
-class FinalLayer(nn.Module):
+class FinalLayerCustom(nn.Module):
     """
     The final layer of DiT.
     """
     def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
-        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
+        self.norm_final = LayerNormCustom(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = LinearCustom(hidden_size, patch_size * patch_size * out_channels, bias=True)
         self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+            SiLUCustom(),
+            LinearCustom(hidden_size, 2 * hidden_size, bias=True)
         )
 
     def forward(self, x, c):
@@ -141,8 +256,7 @@ class FinalLayer(nn.Module):
         x = self.linear(x)
         return x
 
-
-class DiT(nn.Module):
+class DiTCustom(nn.Module):
     """
     Diffusion model with a Transformer backbone.
     """
@@ -167,22 +281,22 @@ class DiT(nn.Module):
         self.num_heads = num_heads
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
-        self.t_embedder = TimestepEmbedder(hidden_size)
+        self.t_embedder = TimestepEmbedderCustom(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
+            DiTBlockCustom(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
         ])
-        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+        self.final_layer = FinalLayerCustom(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
 
     def initialize_weights(self):
         # Initialize transformer layers:
         def _basic_init(module):
-            if isinstance(module, nn.Linear):
+            if isinstance(module, LinearCustom):
                 torch.nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
@@ -326,40 +440,40 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 #################################################################################
 
 def DiT_XL_2(**kwargs):
-    return DiT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
+    return DiTCustom(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
 
 def DiT_XL_4(**kwargs):
-    return DiT(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
+    return DiTCustom(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
 
 def DiT_XL_8(**kwargs):
-    return DiT(depth=28, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
+    return DiTCustom(depth=28, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
 
 def DiT_L_2(**kwargs):
-    return DiT(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
+    return DiTCustom(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
 
 def DiT_L_4(**kwargs):
-    return DiT(depth=24, hidden_size=1024, patch_size=4, num_heads=16, **kwargs)
+    return DiTCustom(depth=24, hidden_size=1024, patch_size=4, num_heads=16, **kwargs)
 
 def DiT_L_8(**kwargs):
-    return DiT(depth=24, hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
+    return DiTCustom(depth=24, hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
 
 def DiT_B_2(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
+    return DiTCustom(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
 
 def DiT_B_4(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=4, num_heads=12, **kwargs)
+    return DiTCustom(depth=12, hidden_size=768, patch_size=4, num_heads=12, **kwargs)
 
 def DiT_B_8(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
+    return DiTCustom(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
 
 def DiT_S_2(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
+    return DiTCustom(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
 
 def DiT_S_4(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
+    return DiTCustom(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
 
 def DiT_S_8(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
+    return DiTCustom(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
 
 
 DiT_models = {
