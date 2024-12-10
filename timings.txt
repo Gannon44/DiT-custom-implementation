@@ -1,0 +1,79 @@
+None:
+Maximum generation time per image: 11.9487 seconds
+Minimum generation time per image: 9.9156 seconds
+Mean generation time per image: 10.6121 seconds
+Median generation time per image: 10.2186 seconds
+Maximum memory usage per image: 4382.87 MB
+Minimum memory usage per image: 4356.21 MB
+Mean memory usage per image: 4379.74 MB
+Median memory usage per image: 4380.87 MB
+Number of samples generated: 20
+
+LayerNorm:
+Maximum generation time per image: 12.6992 seconds
+Minimum generation time per image: 10.6327 seconds
+Mean generation time per image: 11.5491 seconds
+Median generation time per image: 11.2003 seconds
+Maximum memory usage per image: 4382.87 MB
+Minimum memory usage per image: 4356.21 MB
+Mean memory usage per image: 4379.74 MB
+Median memory usage per image: 4380.87 MB
+Number of samples generated: 20
+
+Activations:
+Maximum generation time per image: 12.9604 seconds
+Minimum generation time per image: 10.9983 seconds
+Mean generation time per image: 11.7592 seconds
+Median generation time per image: 11.1853 seconds
+Maximum memory usage per image: 4399.87 MB
+Minimum memory usage per image: 4356.21 MB
+Mean memory usage per image: 4396.79 MB
+Median memory usage per image: 4398.87 MB
+Number of samples generated: 20
+
+Linear:
+Maximum generation time per image: 11.9804 seconds
+Minimum generation time per image: 9.8550 seconds
+Mean generation time per image: 10.6959 seconds
+Median generation time per image: 10.1390 seconds
+Maximum memory usage per image: 4382.87 MB
+Minimum memory usage per image: 4356.21 MB
+Mean memory usage per image: 4379.74 MB
+Median memory usage per image: 4380.87 MB
+Number of samples generated: 20
+
+Attention:
+Maximum generation time per image: 12.1461 seconds
+Minimum generation time per image: 9.6490 seconds
+Mean generation time per image: 10.4949 seconds
+Median generation time per image: 10.0638 seconds
+Maximum memory usage per image: 4386.62 MB
+Minimum memory usage per image: 4356.21 MB
+Mean memory usage per image: 4384.20 MB
+Median memory usage per image: 4385.62 MB
+Number of samples generated: 20
+
+Timestep Embedder:
+Maximum generation time per image: 12.3144 seconds
+Minimum generation time per image: 9.6812 seconds
+Mean generation time per image: 10.7402 seconds
+Median generation time per image: 10.4988 seconds
+Maximum memory usage per image: 4382.87 MB
+Minimum memory usage per image: 4356.21 MB
+Mean memory usage per image: 4379.74 MB
+Median memory usage per image: 4380.87 MB
+Number of samples generated: 20
+
+Full model:
+Maximum generation time per image: 15.0516 seconds
+Minimum generation time per image: 11.8649 seconds
+Mean generation time per image: 12.9234 seconds
+Median generation time per image: 12.2022 seconds
+Maximum memory usage per image: 4400.87 MB
+Minimum memory usage per image: 4356.21 MB
+Mean memory usage per image: 4397.74 MB
+Median memory usage per image: 4399.87 MB
+Number of samples generated: 20
+
+
+
